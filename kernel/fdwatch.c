@@ -159,6 +159,21 @@ static atomic64_t fdw_failed = ATOMIC64_INIT(0);
 static atomic64_t fdw_dropped = ATOMIC64_INIT(0);
 static atomic64_t fdw_partial = ATOMIC64_INIT(0);
 
+/*
+ * fd_install is reachable on this kernel (measured: 893 hits in a ten-second
+ * run), but only a handful of those are "a regular file that was just
+ * created".  These counters exist so that "the event log is silent" can be
+ * told apart from "the probe never ran" - the distinction that a hit count
+ * alone cannot make.
+ */
+static atomic64_t fdw_fd_hits = ATOMIC64_INIT(0);
+static atomic64_t fdw_fd_reg = ATOMIC64_INIT(0);
+static atomic64_t fdw_fd_pass = ATOMIC64_INIT(0);
+
+static bool debug_fds;
+module_param_named(debug_fds, debug_fds, bool, 0644);
+MODULE_PARM_DESC(debug_fds, "log every fd_install (noisy; for measuring the filter)");
+
 /* ---- hook-point reachability scan ---------------------------------- */
 
 struct fdw_cand {
@@ -250,21 +265,37 @@ static void fdw_dentry_name(struct dentry *d, char *out, size_t outsz)
 		strscpy(out, (const char *)n, outsz);
 }
 
-/* The event layer.  Only registered when scan_symbols is off, because on the
- * target kernel fd_install is measurably unreachable. */
+/* The event layer. */
 static void fdw_log_new_fd(unsigned int fd, struct file *file)
 {
 	struct inode *inode;
 	char name[64];
+	umode_t mode;
+	loff_t size;
 
+	atomic64_inc(&fdw_fd_hits);
 	if (!file || !file->f_inode)
 		return;
 	inode = file->f_inode;
-	if (!S_ISREG(inode->i_mode) || !(file->f_mode & FMODE_WRITE))
+	mode = inode->i_mode;
+	size = i_size_read(inode);
+
+	if (debug_fds) {
+		fdw_dentry_name(file->f_path.dentry, name, sizeof(name));
+		pr_info("fd_install fd=%u pid=%d comm=%s mode=%o f_mode=0x%x size=%lld name='%s'\n",
+			fd, current->pid, current->comm, mode, file->f_mode,
+			(long long)size, name);
+	}
+
+	if (!S_ISREG(mode))
 		return;
-	if (i_size_read(inode) != 0)
+	atomic64_inc(&fdw_fd_reg);
+	if (!(file->f_mode & FMODE_WRITE))
+		return;
+	if (size != 0)
 		return;
 
+	atomic64_inc(&fdw_fd_pass);
 	fdw_dentry_name(file->f_path.dentry, name, sizeof(name));
 	pr_info("new fd %u -> '%s' pid=%d comm=%s (size=0, writable)\n",
 		fd, name, current->pid, current->comm);
@@ -464,6 +495,7 @@ static void fdw_do_dump(struct fdw_slot *slot)
 	char ts[40], path[PATH_MAX];
 	ssize_t got, n;
 	bool via_mapping = false;
+	bool reverted = false;
 
 	size = i_size_read(inode);
 	cap = (unsigned long)max_dump_mb * 1024 * 1024;
@@ -490,14 +522,24 @@ static void fdw_do_dump(struct fdw_slot *slot)
 	 * SELinux domain, which has no business reading an app's database -
 	 * measured: kernel_read() came back -EACCES until this was moved inside
 	 * the credential override.
+	 *
+	 * FMODE_READ is checked first on purpose: __kernel_read() starts with
+	 * WARN_ON_ONCE(!(file->f_mode & FMODE_READ)), so calling it on the
+	 * write-only file that `dd`/`cp`/most packers create would put a
+	 * WARNING in the kernel log on every poll.  Such a file goes straight to
+	 * the page-cache path.
 	 */
-	old = override_creds(slot->cred);
-	got = kernel_read(slot->file, buf, (size_t)size, &pos);
+	if (slot->file->f_mode & FMODE_READ) {
+		old = override_creds(slot->cred);
+		got = kernel_read(slot->file, buf, (size_t)size, &pos);
+		revert_creds(old);
+	} else {
+		got = 0;
+	}
 	if (got <= 0) {
 		got = fdw_read_mapping(inode, buf, (size_t)size);
 		via_mapping = true;
 	}
-	revert_creds(old);
 
 	if (got <= 0) {
 		pr_warn_ratelimited("cannot read '%s' (%ld)\n",
@@ -511,19 +553,36 @@ static void fdw_do_dump(struct fdw_slot *slot)
 		 dump_dir, ts, slot->how, slot->pid,
 		 slot->comm[0] ? slot->comm : "?", slot->ino);
 
+	/*
+	 * Creating the dump is attempted with the caller's credentials first,
+	 * so that a root/su loader gets exactly the permissions it would have on
+	 * its own.  But the caller is often an ordinary app - and an app cannot
+	 * write into /data/local/tmp at all, which showed up as -EACCES on every
+	 * single capture.  In that case fall back to the kernel's own
+	 * credentials before giving up.
+	 */
+	out = ERR_PTR(-EACCES);
 	old = override_creds(slot->cred);
 	out = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, 0644);
 	if (IS_ERR(out)) {
 		revert_creds(old);
+		reverted = true;
+		out = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE,
+				0644);
+	}
+	if (IS_ERR(out)) {
+		if (!reverted)
+			revert_creds(old);
 		atomic64_inc(&fdw_failed);
-		pr_err("cannot create %s (%ld) - does %s exist?\n",
+		pr_err("cannot create %s (%ld) - does %s exist, and is it writable?\n",
 		       path, (long)PTR_ERR(out), dump_dir);
 		vfree(buf);
 		return;
 	}
 	n = kernel_write(out, buf, (size_t)got, &w);
 	filp_close(out, NULL);
-	revert_creds(old);
+	if (!reverted)
+		revert_creds(old);
 	vfree(buf);
 
 	if (n == got) {
@@ -663,11 +722,14 @@ static void __exit fdw_exit(void)
 	fdw_slots = NULL;
 	fdw_nslots = 0;
 
-	pr_info("unloaded: captured=%lld partial=%lld failed=%lld dropped=%lld\n",
+	pr_info("unloaded: captured=%lld partial=%lld failed=%lld dropped=%lld  fd_install hits=%lld regular=%lld passed-filter=%lld\n",
 		(long long)atomic64_read(&fdw_captured),
 		(long long)atomic64_read(&fdw_partial),
 		(long long)atomic64_read(&fdw_failed),
-		(long long)atomic64_read(&fdw_dropped));
+		(long long)atomic64_read(&fdw_dropped),
+		(long long)atomic64_read(&fdw_fd_hits),
+		(long long)atomic64_read(&fdw_fd_reg),
+		(long long)atomic64_read(&fdw_fd_pass));
 }
 
 module_init(fdw_init);
