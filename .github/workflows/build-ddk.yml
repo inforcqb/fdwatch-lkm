@@ -1,0 +1,198 @@
+name: build-lkm-ddk
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  # One .ko per GKI 5.15 variant.  A module is not portable between them:
+  # vermagic differs and so do the prototypes of the three functions this
+  # module probes by name.
+  module:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - android13-5.15
+          - android14-5.15
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.variant }}-20260828
+      options: --privileged
+
+    steps:
+      - name: Inspect DDK environment
+        run: |
+          echo "variant   = ${{ matrix.variant }}"
+          echo "KDIR      = $KDIR"
+          echo "KERNEL_SRC= $KERNEL_SRC"
+          clang --version | head -1
+
+      - name: Checkout module
+        uses: actions/checkout@v4
+
+      # The probe argument layout is the whole contract: each handler reads its
+      # arguments straight out of regs->regs[N].  A prototype that changed
+      # between releases would silently make us read the wrong register, so the
+      # declarations are checked against the tree we actually compile against,
+      # per variant.
+      - name: Assert the three probed prototypes
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          T=""
+          for d in "${KERNEL_SRC:-}" "${KDIR:-}" "/opt/ddk/src/$V" "/opt/ddk/kdir/$V" /opt/ddk/src/* /opt/ddk/kdir/*; do
+            if [ -n "$d" ] && [ -f "$d/fs/file.c" ]; then T="$d"; break; fi
+          done
+          if [ -z "$T" ]; then
+            echo "::error::no kernel tree with fs/file.c found (variant=$V)"
+            exit 1
+          fi
+          echo "=== kernel tree: $T ==="
+
+          echo "--- fd_install(unsigned int fd, struct file *file) : x0=fd x1=file ---"
+          grep -nA1 '^void fd_install(unsigned int fd, struct file \*file)' "$T/fs/file.c" || {
+            echo "::error::fd_install does not have the expected prototype in $V - the fd_install handler reads x0/x1 as fd/file"
+            exit 1
+          }
+          grep -q 'EXPORT_SYMBOL(fd_install)' "$T/fs/file.c" && echo "  (and it is EXPORT_SYMBOL)" || true
+
+          echo "--- do_sys_ftruncate(unsigned int fd, loff_t length, int small) : x0=fd x1=length ---"
+          grep -nA1 '^long do_sys_ftruncate(unsigned int fd, loff_t length, int small)' "$T/fs/open.c" || {
+            echo "::error::do_sys_ftruncate does not have the expected prototype in $V - the ftruncate handler reads x1 as the length"
+            exit 1
+          }
+
+          echo "--- vfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos) : x0=file x2=count ---"
+          grep -nA1 '^ssize_t vfs_write(struct file \*file, const char __user \*buf, size_t count, loff_t \*pos)' "$T/fs/read_write.c" || {
+            echo "::error::vfs_write does not have the expected prototype in $V - the vfs_write handler reads x2 as the count"
+            exit 1
+          }
+
+      # The module links only against exported symbols.  fd_install /
+      # do_sys_ftruncate / vfs_write must NOT appear here: they are resolved by
+      # NAME through register_kprobe(), which needs no link-time reference.
+      #
+      # NECESSARY, NOT SUFFICIENT: this checks the tree the module is compiled
+      # against.  What the DEVICE kernel exports to modules is its own business -
+      # measured on the target PJA110 (5.15.180-android13-8) the device refuses
+      # filp_open/kernel_write with "Unknown symbol ... (err -2)" even though
+      # this tree exports them, so the module can only be loaded there with
+      # KernelSU's `ksud insmod`, which binds undefined symbols to kallsyms
+      # addresses before init_module(2) and never consults the export table.
+      - name: Assert every imported symbol is exported by this tree
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          T=""
+          for d in "${KERNEL_SRC:-}" "${KDIR:-}" "/opt/ddk/src/$V" "/opt/ddk/kdir/$V" /opt/ddk/src/* /opt/ddk/kdir/*; do
+            if [ -n "$d" ] && [ -f "$d/fs/file.c" ]; then T="$d"; break; fi
+          done
+          echo "=== kernel tree: $T ==="
+          fail=0
+          for s in filp_open kernel_write filp_close override_creds revert_creds \
+                   vmalloc vfree register_kprobe unregister_kprobe \
+                   alloc_workqueue destroy_workqueue drain_workqueue \
+                   queue_delayed_work_on cancel_delayed_work_sync \
+                   ktime_get_real_ts64 time64_to_tm strscpy; do
+            hit=$(grep -rhnE "EXPORT_SYMBOL[A-Z_]*\($s[,)]" "$T/fs" "$T/kernel" "$T/mm" "$T/lib" 2>/dev/null | head -1)
+            if [ -z "$hit" ]; then
+              echo "::error::$s is not exported by this tree (variant $V) - the module would fail to load with 'Unknown symbol $s'"
+              fail=1
+            else
+              printf '  %-26s %s\n' "$s" "$(echo "$hit" | sed 's/^[0-9]*://')"
+            fi
+          done
+          [ "$fail" = "0" ] || exit 1
+
+          echo "--- the VFS namespace those four are exported in ---"
+          grep -rn 'ANDROID_GKI_VFS_EXPORT_ONLY=' "$T/fs/Makefile" "$T/kernel/Makefile" 2>/dev/null || {
+            echo "::error::no ANDROID_GKI_VFS_EXPORT_ONLY definition found in $V"
+            exit 1
+          }
+
+      - name: Build fdwatch.ko (DDK way)
+        run: |
+          set -e
+          make -k -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
+          ls -la kernel/fdwatch.ko
+          file kernel/fdwatch.ko
+
+      - name: Verify the artifact
+        run: |
+          set -e
+          f=kernel/fdwatch.ko
+
+          echo "--- modinfo ---"
+          readelf -p .modinfo "$f" | sed 's/^/  /' || true
+
+          echo "--- KMI version-check state ---"
+          vs=$(readelf -SW "$f" | awk '/\] __versions/ {print $6}')
+          sv=$(readelf -p .modinfo "$f" | grep -c 'srcversion=' || true)
+          ml=$(nm -u "$f" | grep -c 'module_layout' || true)
+          echo "__versions size=${vs:-?} srcversion=${sv} module_layout=${ml}"
+          if [ "${vs:-0}" = "0" ] || [ "${sv:-0}" = "0" ] || [ "${ml:-0}" = "0" ]; then
+            echo "::warning::no symbol CRCs in this build tree: load-time version checks are inert"
+          fi
+
+          echo "--- VFS namespace import (load-fatal if missing) ---"
+          readelf -p .modinfo "$f" 2>/dev/null | grep 'import_ns' || {
+            echo "::error::no import_ns entry - filp_open/kernel_write/override_creds/revert_creds will be refused on load"
+            exit 1
+          }
+
+          echo "--- undefined symbols ---"
+          nm -u "$f" | sed 's/^/  /'
+
+          echo "--- probe targets must NOT be linked against (regression gate) ---"
+          n=$(nm -u "$f" | grep -cE '(^| )(fd_install|do_sys_ftruncate|vfs_write)$' || true)
+          echo "  undefined probe-target symbols: $n (must be 0)"
+          if [ "$n" != "0" ]; then
+            echo "::error::$f imports a probe target: they must be resolved by name via register_kprobe()"
+            exit 1
+          fi
+
+          echo "--- no kallsyms_* link-time dependency ---"
+          ks=$(nm -u "$f" | grep -cE '(^| )(kallsyms_lookup_name|kallsyms_lookup|kallsyms_lookup_size_offset|kallsyms_on_each_symbol|kallsyms_on_each_match_symbol)$' || true)
+          echo "  undefined kallsyms-ish symbols: $ks (must be 0)"
+          [ "$ks" = "0" ] || exit 1
+
+      # Under CONFIG_LTO_CLANG_FULL a static function with few callers can be
+      # inlined away and disappear from kallsyms, and register_kprobe() then
+      # fails at module_init on the device.  If the image ships a symbol map,
+      # that is checkable here - before anyone loads anything.
+      - name: Check the three probe targets in the DDK image (best effort)
+        run: |
+          set -e
+          V="${{ matrix.variant }}"
+          S=""
+          for d in "${KDIR:-}" "${KERNEL_SRC:-}" "/opt/ddk/kdir/$V" "/opt/ddk/src/$V" /opt/ddk/kdir/* /opt/ddk/src/*; do
+            if [ -n "$d" ] && { [ -f "$d/vmlinux" ] || [ -f "$d/System.map" ]; }; then S="$d"; break; fi
+          done
+          if [ -z "$S" ]; then
+            echo "no vmlinux/System.map in the DDK image - this check cannot be done here and is NOT being skipped quietly."
+            echo "On the device: grep -E ' (fd_install|do_sys_ftruncate|vfs_write)\$' /proc/kallsyms"
+            exit 0
+          fi
+          echo "=== symbol source: $S ==="
+          fail=0
+          for s in fd_install do_sys_ftruncate vfs_write; do
+            n=0
+            [ -f "$S/System.map" ] && n=$(grep -cE "(^|[[:space:]])$s\$" "$S/System.map" || true)
+            if [ "${n:-0}" = "0" ] && [ -f "$S/vmlinux" ]; then
+              n=$(nm "$S/vmlinux" 2>/dev/null | grep -cE "(^|[[:space:]])$s\$" || true)
+            fi
+            printf '  %-20s %s\n' "$s" "${n:-0}"
+            [ "${n:-0}" = "0" ] && fail=1
+          done
+          if [ "$fail" = "1" ]; then
+            echo "::error::a probe target is missing from $S - register_kprobe() would fail at module_init"
+            exit 1
+          fi
+
+      - name: Upload .ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdwatch.ko-${{ matrix.variant }}
+          path: kernel/fdwatch.ko
+          if-no-files-found: error
