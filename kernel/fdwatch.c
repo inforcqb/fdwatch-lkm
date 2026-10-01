@@ -465,6 +465,7 @@ static void fdw_work(struct work_struct *work)
 
 static int __init fdw_init(void)
 {
+	unsigned int i;
 	int ret;
 
 	if (slots < 1 || slots > FDW_MAX_SLOTS)
@@ -480,6 +481,13 @@ static int __init fdw_init(void)
 	if (!fdw_slots)
 		return -ENOMEM;
 	fdw_nslots = slots;
+	/*
+	 * Every slot's delayed work is initialised once, here.  fdw_arm() only
+	 * queues a slot that is not busy, i.e. one whose work is not pending, so
+	 * re-initialising per capture is neither needed nor safe.
+	 */
+	for (i = 0; i < fdw_nslots; i++)
+		INIT_DELAYED_WORK(&fdw_slots[i].work, fdw_work);
 
 	fdw_wq = alloc_workqueue("fdwatch", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 	if (!fdw_wq) {
