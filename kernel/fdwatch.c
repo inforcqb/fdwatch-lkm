@@ -16,29 +16,27 @@
  *
  * From userspace the interesting window is a fraction of a second wide, the
  * file has no name for most of it, and polling /proc/<pid>/fd loses the race
- * the moment the creator exits (and a 27k-fd snapshot on this device costs
- * ~220 ms, i.e. a whole attack window per poll).  The kernel does not have that
+ * the moment the creator exits (a full snapshot of this device's 27k fds costs
+ * ~220 ms - a whole attack window per poll).  The kernel does not have that
  * problem: at the instant the fd is installed we can take a reference on the
  * `struct file`, and that reference keeps the inode alive no matter what the
  * owner does afterwards - unlink it, close it, execve over itself.  The dump
  * then happens later, calmly, from a workqueue.
  *
- * THREE PROBES, THREE JOBS
- * ------------------------
- *   fd_install        the event layer.  Every newly installed fd whose file is
- *                     a regular file of size 0 with write permission - i.e. a
- *                     file that was just created or just truncated - is logged
- *                     with its basename, pid and comm.  Pure observation: no
- *                     reference is taken, so the cost stays a few instructions.
- *
+ * PROBES
+ * ------
  *   do_sys_ftruncate  the trigger.  ftruncate(fd, len) with len >= min_size_mb
  *                     is the sharpest signature of a dropping packer: declaring
  *                     a multi-megabyte size on a file nobody has written yet.
  *                     fdget() resolves the fd to a `struct file` right there
- *                     (atomic-safe) and the reference is kept.
+ *                     (atomic-safe) and its reference is kept.
  *
- *   vfs_write         the backstop, for a payload written in one big go without
- *                     an ftruncate first: count >= min_write_kb.
+ *   vfs_write         the backstop, for a payload written in one big go with no
+ *                     ftruncate first: count >= min_write_kb.
+ *
+ *   fd_install        the event layer: log every newly created regular file.
+ *                     MEASURED DEAD on the target kernel - see the note on
+ *                     fdw_cand_names[] below.
  *
  * A capture is `get_file()` plus a delayed work item.  The delay exists because
  * at trigger time the file is usually still empty - the payload is written
@@ -75,6 +73,8 @@
 #include <linux/uaccess.h>
 #include <linux/atomic.h>
 #include <linux/spinlock.h>
+#include <linux/pagemap.h>
+#include <linux/highmem.h>
 #include <linux/version.h>
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0) || \
@@ -82,7 +82,7 @@
 #error "fdwatch targets Linux 5.15 (GKI android13-5.15 / android14-5.15) only"
 #endif
 
-#define FDW_VERSION "1.0.0"
+#define FDW_VERSION "1.1.0"
 
 /* ------------------------------------------------------------------ */
 /* tunables                                                            */
@@ -107,12 +107,22 @@ static unsigned int max_dump_mb = 128;
 module_param_named(max_dump_mb, max_dump_mb, uint, 0644);
 MODULE_PARM_DESC(max_dump_mb, "largest file this module will dump (MiB)");
 
-static bool log_fds = true;
-module_param_named(log_fds, log_fds, bool, 0644);
-
 static unsigned int slots = 8;
 module_param_named(slots, slots, uint, 0444);
 MODULE_PARM_DESC(slots, "concurrent captures in flight (1-32)");
+
+/*
+ * Register a counter-only kprobe on each candidate symbol and print the hit
+ * counts at unload.  This is not decoration: under CONFIG_LTO_CLANG_FULL a
+ * symbol can be present in kallsyms, register_kprobe() can succeed, and the
+ * handler still never runs because the kernel's own call sites were inlined or
+ * cloned.  Measured on the target PJA110: do_sys_ftruncate and vfs_write fire,
+ * fd_install stayed at zero hits through a whole test run - so the event layer
+ * must not be built on fd_install without re-measuring.
+ */
+static bool scan_symbols;
+module_param_named(scan, scan_symbols, bool, 0644);
+MODULE_PARM_DESC(scan, "count hits per candidate hook point and report at unload");
 
 #define FDW_MAX_SLOTS	32
 #define FDW_POLLS	12
@@ -125,7 +135,7 @@ MODULE_PARM_DESC(slots, "concurrent captures in flight (1-32)");
 struct fdw_slot {
 	struct delayed_work work;
 	struct file *file;		/* reference held while armed */
-	const struct cred *cred;	/* creds of whoever caused the drop */
+	const struct cred *cred;
 	unsigned long ino;
 	dev_t dev;
 	pid_t pid;
@@ -144,10 +154,72 @@ static DEFINE_SPINLOCK(fdw_lock);
 static struct workqueue_struct *fdw_wq;
 static bool fdw_stopping;
 
-static atomic64_t fdw_events = ATOMIC64_INIT(0);
 static atomic64_t fdw_captured = ATOMIC64_INIT(0);
 static atomic64_t fdw_failed = ATOMIC64_INIT(0);
 static atomic64_t fdw_dropped = ATOMIC64_INIT(0);
+static atomic64_t fdw_partial = ATOMIC64_INIT(0);
+
+/* ---- hook-point reachability scan ---------------------------------- */
+
+struct fdw_cand {
+	const char *sym;
+	struct kprobe kp;
+	atomic64_t hits;
+	bool live;
+};
+
+static struct fdw_cand fdw_cands[] = {
+	{ .sym = "do_sys_ftruncate" },	/* capture trigger  */
+	{ .sym = "vfs_write" },		/* capture backstop */
+	{ .sym = "fd_install" },	/* event layer      */
+	{ .sym = "get_unused_fd_flags" },
+	{ .sym = "vfs_open" },
+	{ .sym = "do_filp_open" },
+	{ .sym = "path_openat" },
+	{ .sym = "do_sys_openat2" },
+	{ .sym = "ksys_openat" },
+	{ .sym = "__arm64_sys_openat" },
+	{ .sym = "__arm64_sys_openat2" },
+	{ .sym = "__arm64_sys_ftruncate" },
+	{ .sym = "ksys_write" },
+	{ .sym = "vfs_truncate" },
+	{ .sym = "vfs_unlink" },
+	{ .sym = "do_unlinkat" },
+};
+#define FDW_NCANDS	ARRAY_SIZE(fdw_cands)
+
+static int fdw_cand_hit(struct kprobe *p, struct pt_regs *regs)
+{
+	struct fdw_cand *c = container_of(p, struct fdw_cand, kp);
+
+	atomic64_inc(&c->hits);
+	return 0;
+}
+
+static void fdw_scan_register(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < FDW_NCANDS; i++) {
+		fdw_cands[i].kp.symbol_name = fdw_cands[i].sym;
+		fdw_cands[i].kp.pre_handler = fdw_cand_hit;
+		fdw_cands[i].live =
+			register_kprobe(&fdw_cands[i].kp) == 0;
+	}
+}
+
+static void fdw_scan_unregister(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < FDW_NCANDS; i++) {
+		if (!fdw_cands[i].live)
+			continue;
+		unregister_kprobe(&fdw_cands[i].kp);
+		pr_info("reachability: %-26s hits=%lld\n", fdw_cands[i].sym,
+			(long long)atomic64_read(&fdw_cands[i].hits));
+	}
+}
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -178,39 +250,49 @@ static void fdw_dentry_name(struct dentry *d, char *out, size_t outsz)
 		strscpy(out, (const char *)n, outsz);
 }
 
-/* The event layer: two dereferences and a compare in the common case. */
+/* The event layer.  Only registered when scan_symbols is off, because on the
+ * target kernel fd_install is measurably unreachable. */
 static void fdw_log_new_fd(unsigned int fd, struct file *file)
 {
 	struct inode *inode;
 	char name[64];
 
-	if (!log_fds || !file || !file->f_inode)
+	if (!file || !file->f_inode)
 		return;
 	inode = file->f_inode;
 	if (!S_ISREG(inode->i_mode) || !(file->f_mode & FMODE_WRITE))
 		return;
-	/* freshly created / freshly truncated only */
 	if (i_size_read(inode) != 0)
 		return;
 
 	fdw_dentry_name(file->f_path.dentry, name, sizeof(name));
 	pr_info("new fd %u -> '%s' pid=%d comm=%s (size=0, writable)\n",
 		fd, name, current->pid, current->comm);
-	atomic64_inc(&fdw_events);
 }
 
+static int fdw_p_fd_install(struct kprobe *p, struct pt_regs *regs)
+{
+	fdw_log_new_fd((unsigned int)regs->regs[0],
+		       (struct file *)regs->regs[1]);
+	return 0;
+}
+
+static struct kprobe fdw_kp_fd_install = {
+	.symbol_name = "fd_install",
+	.pre_handler = fdw_p_fd_install,
+};
+
 /*
- * Arm a capture for `file`; takes its own reference.  Probe context only:
- * spinlock + get_file + get_current_cred + queue_delayed_work, nothing that
- * can sleep.
+ * Arm a capture for `file`; takes its own reference on both the file and the
+ * caller's creds.  Probe context only: spinlock, get_file, get_current_cred,
+ * queue_delayed_work - nothing that can sleep.
  */
 static bool fdw_arm(struct file *file, const char *how, loff_t want,
 		    unsigned long delay_ms)
 {
 	struct inode *inode;
 	struct fdw_slot *slot = NULL;
-	unsigned long flags, i;
-	unsigned long ino;
+	unsigned long flags, i, ino;
 	dev_t dev;
 
 	if (!file || !file->f_inode || !file->f_inode->i_sb)
@@ -220,12 +302,11 @@ static bool fdw_arm(struct file *file, const char *how, loff_t want,
 	dev = (dev_t)inode->i_sb->s_dev;
 
 	spin_lock_irqsave(&fdw_lock, flags);
-	/* already tracking this inode? then there is nothing to do */
 	for (i = 0; i < fdw_nslots; i++) {
 		if (fdw_slots[i].busy && fdw_slots[i].ino == ino &&
 		    fdw_slots[i].dev == dev) {
 			spin_unlock_irqrestore(&fdw_lock, flags);
-			return true;
+			return true;	/* already tracking this inode */
 		}
 	}
 	for (i = 0; i < fdw_nslots; i++) {
@@ -265,28 +346,7 @@ static bool fdw_arm(struct file *file, const char *how, loff_t want,
 /* probes                                                              */
 /* ------------------------------------------------------------------ */
 
-/* void fd_install(unsigned int fd, struct file *file) */
-static int fdw_p_fd_install(struct kprobe *p, struct pt_regs *regs)
-{
-	if (unlikely(!capture_enabled))
-		return 0;
-	fdw_log_new_fd((unsigned int)regs->regs[0],
-		       (struct file *)regs->regs[1]);
-	return 0;
-}
-
-static struct kprobe fdw_kp_fd_install = {
-	.symbol_name = "fd_install",
-	.pre_handler = fdw_p_fd_install,
-};
-
-/*
- * long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
- *
- * fdget() is deliberate: it is the atomic half of the fd lookup and hands back
- * a reference that can be kept, which is exactly what lets the dump survive a
- * later unlink()/execve().
- */
+/* long do_sys_ftruncate(unsigned int fd, loff_t length, int small) */
 static int fdw_p_ftruncate(struct kprobe *p, struct pt_regs *regs)
 {
 	unsigned int fd = (unsigned int)regs->regs[0];
@@ -311,10 +371,8 @@ static struct kprobe fdw_kp_ftruncate = {
 	.pre_handler = fdw_p_ftruncate,
 };
 
-/*
- * ssize_t vfs_write(struct file *file, const char __user *buf,
- *                   size_t count, loff_t *pos)
- */
+/* ssize_t vfs_write(struct file *file, const char __user *buf,
+ *                   size_t count, loff_t *pos) */
 static int fdw_p_vfs_write(struct kprobe *p, struct pt_regs *regs)
 {
 	struct file *file = (struct file *)regs->regs[0];
@@ -332,6 +390,42 @@ static struct kprobe fdw_kp_vfs_write = {
 	.symbol_name = "vfs_write",
 	.pre_handler = fdw_p_vfs_write,
 };
+
+/* ------------------------------------------------------------------ */
+/* reading the captured file                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Fallback for a file we may not read through its own `struct file`: either it
+ * was opened write-only (FMODE_READ clear -> kernel_read() returns -EBADF) or
+ * security_file_permission() refuses the read on the creds we happen to run
+ * with.  The bytes are still in the page cache, and read_mapping_page() goes
+ * straight to it without the file's permission checks.
+ *
+ * A full-page short read is normal here: the file may be growing while we read
+ * it, and the next poll will pick up more.
+ */
+static ssize_t fdw_read_mapping(struct inode *inode, void *buf, size_t len)
+{
+	pgoff_t index = 0;
+	size_t done = 0;
+
+	while (done < len) {
+		struct page *page;
+		size_t chunk;
+
+		page = read_mapping_page(inode->i_mapping, index, NULL);
+		if (IS_ERR(page))
+			break;
+		chunk = min_t(size_t, PAGE_SIZE, len - done);
+		memcpy((char *)buf + done, kmap(page), chunk);
+		kunmap(page);
+		put_page(page);
+		done += chunk;
+		index++;
+	}
+	return (ssize_t)done;
+}
 
 /* ------------------------------------------------------------------ */
 /* the dump worker                                                     */
@@ -369,6 +463,7 @@ static void fdw_do_dump(struct fdw_slot *slot)
 	void *buf;
 	char ts[40], path[PATH_MAX];
 	ssize_t got, n;
+	bool via_mapping = false;
 
 	size = i_size_read(inode);
 	cap = (unsigned long)max_dump_mb * 1024 * 1024;
@@ -385,13 +480,27 @@ static void fdw_do_dump(struct fdw_slot *slot)
 
 	buf = vmalloc((size_t)size);
 	if (!buf) {
-		pr_warn_ratelimited("no memory for a %lld byte dump\n", (long long)size);
+		pr_warn_ratelimited("no memory for a %lld byte dump\n",
+				    (long long)size);
 		return;
 	}
 
+	/*
+	 * Read as whoever caused the drop.  A kworker runs in the kernel
+	 * SELinux domain, which has no business reading an app's database -
+	 * measured: kernel_read() came back -EACCES until this was moved inside
+	 * the credential override.
+	 */
+	old = override_creds(slot->cred);
 	got = kernel_read(slot->file, buf, (size_t)size, &pos);
 	if (got <= 0) {
-		pr_warn_ratelimited("cannot read '%s' (%ld) - opened write-only?\n",
+		got = fdw_read_mapping(inode, buf, (size_t)size);
+		via_mapping = true;
+	}
+	revert_creds(old);
+
+	if (got <= 0) {
+		pr_warn_ratelimited("cannot read '%s' (%ld)\n",
 				    slot->name, (long)got);
 		vfree(buf);
 		return;
@@ -420,9 +529,12 @@ static void fdw_do_dump(struct fdw_slot *slot)
 	if (n == got) {
 		slot->best = (unsigned long)got;
 		atomic64_inc(&fdw_captured);
-		pr_info("captured %ld bytes (%s) -> %s (pid=%d comm=%s name=%s)\n",
-			(long)got, slot->how, path, slot->pid, slot->comm,
-			slot->name);
+		if ((unsigned long)got < (unsigned long)size)
+			atomic64_inc(&fdw_partial);
+		pr_info("captured %ld/%lld bytes (%s%s) -> %s (pid=%d comm=%s name=%s)\n",
+			(long)got, (long long)size, slot->how,
+			via_mapping ? ",pagecache" : "", path, slot->pid,
+			slot->comm, slot->name);
 		fdw_index(slot, path, (unsigned long)got);
 	} else {
 		atomic64_inc(&fdw_failed);
@@ -452,8 +564,6 @@ static void fdw_work(struct work_struct *work)
 		put_cred(slot->cred);
 		slot->cred = NULL;
 	}
-	/* Released last and under the lock, so the next probe cannot observe a
-	 * half-cleared slot. */
 	spin_lock_irq(&fdw_lock);
 	slot->busy = false;
 	spin_unlock_irq(&fdw_lock);
@@ -481,11 +591,6 @@ static int __init fdw_init(void)
 	if (!fdw_slots)
 		return -ENOMEM;
 	fdw_nslots = slots;
-	/*
-	 * Every slot's delayed work is initialised once, here.  fdw_arm() only
-	 * queues a slot that is not busy, i.e. one whose work is not pending, so
-	 * re-initialising per capture is neither needed nor safe.
-	 */
 	for (i = 0; i < fdw_nslots; i++)
 		INIT_DELAYED_WORK(&fdw_slots[i].work, fdw_work);
 
@@ -507,13 +612,16 @@ static int __init fdw_init(void)
 		unregister_kprobe(&fdw_kp_ftruncate);
 		goto err;
 	}
-	ret = register_kprobe(&fdw_kp_fd_install);
-	if (ret)
-		pr_warn("cannot probe fd_install (%d) - the event log stays off\n",
-			ret);
 
-	pr_info("v%s armed: ftruncate>=%uMiB, write>=%uKiB, dump_dir=%s, %u slots\n",
-		FDW_VERSION, min_size_mb, min_write_kb, dump_dir, fdw_nslots);
+	if (scan_symbols) {
+		fdw_scan_register();
+	} else if (register_kprobe(&fdw_kp_fd_install)) {
+		pr_warn("cannot probe fd_install - the event log stays off\n");
+	}
+
+	pr_info("v%s armed: ftruncate>=%uMiB, write>=%uKiB, dump_dir=%s, %u slots%s\n",
+		FDW_VERSION, min_size_mb, min_write_kb, dump_dir, fdw_nslots,
+		scan_symbols ? " (symbol scan ON)" : "");
 	return 0;
 
 err:
@@ -530,13 +638,14 @@ static void __exit fdw_exit(void)
 	unsigned int i;
 
 	fdw_stopping = true;
-	unregister_kprobe(&fdw_kp_fd_install);
 	unregister_kprobe(&fdw_kp_vfs_write);
 	unregister_kprobe(&fdw_kp_ftruncate);
+	if (scan_symbols)
+		fdw_scan_unregister();
+	else
+		unregister_kprobe(&fdw_kp_fd_install);
 
 	if (fdw_wq) {
-		/* cancel first: a work item that re-arms itself would otherwise
-		 * keep the queue busy forever */
 		for (i = 0; i < fdw_nslots; i++)
 			cancel_delayed_work_sync(&fdw_slots[i].work);
 		drain_workqueue(fdw_wq);
@@ -554,9 +663,9 @@ static void __exit fdw_exit(void)
 	fdw_slots = NULL;
 	fdw_nslots = 0;
 
-	pr_info("unloaded: fd-events=%lld captured=%lld failed=%lld dropped=%lld\n",
-		(long long)atomic64_read(&fdw_events),
+	pr_info("unloaded: captured=%lld partial=%lld failed=%lld dropped=%lld\n",
 		(long long)atomic64_read(&fdw_captured),
+		(long long)atomic64_read(&fdw_partial),
 		(long long)atomic64_read(&fdw_failed),
 		(long long)atomic64_read(&fdw_dropped));
 }
