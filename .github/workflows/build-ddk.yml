@@ -90,11 +90,13 @@ jobs:
           done
           echo "=== kernel tree: $T ==="
           fail=0
+          # read_mapping_page is a static inline in include/linux/pagemap.h; the
+          # symbol that actually has to be exported is the one it calls.
           for s in filp_open kernel_write filp_close override_creds revert_creds \
                    vmalloc vfree register_kprobe unregister_kprobe \
                    alloc_workqueue destroy_workqueue drain_workqueue \
                    queue_delayed_work_on cancel_delayed_work_sync \
-                   ktime_get_real_ts64 time64_to_tm strscpy read_mapping_page; do
+                   ktime_get_real_ts64 time64_to_tm strscpy read_cache_page; do
             hit=$(grep -rhnE "EXPORT_SYMBOL[A-Z_]*\($s[,)]" "$T/fs" "$T/kernel" "$T/mm" "$T/lib" 2>/dev/null | head -1)
             if [ -z "$hit" ]; then
               echo "::error::$s is not exported by this tree (variant $V) - the module would fail to load with 'Unknown symbol $s'"
