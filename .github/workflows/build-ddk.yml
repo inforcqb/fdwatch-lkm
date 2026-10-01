@@ -94,7 +94,7 @@ jobs:
                    vmalloc vfree register_kprobe unregister_kprobe \
                    alloc_workqueue destroy_workqueue drain_workqueue \
                    queue_delayed_work_on cancel_delayed_work_sync \
-                   ktime_get_real_ts64 time64_to_tm strscpy; do
+                   ktime_get_real_ts64 time64_to_tm strscpy read_mapping_page; do
             hit=$(grep -rhnE "EXPORT_SYMBOL[A-Z_]*\($s[,)]" "$T/fs" "$T/kernel" "$T/mm" "$T/lib" 2>/dev/null | head -1)
             if [ -z "$hit" ]; then
               echo "::error::$s is not exported by this tree (variant $V) - the module would fail to load with 'Unknown symbol $s'"
