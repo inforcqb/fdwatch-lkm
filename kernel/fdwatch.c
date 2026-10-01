@@ -153,6 +153,20 @@ static atomic64_t fdw_dropped = ATOMIC64_INIT(0);
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+/* Wall-clock stamp for file names: YYYYMMDD-HHMMSS-uuuuuu */
+static void fdw_ts(char *buf, size_t len)
+{
+	struct timespec64 ts;
+	struct tm tm;
+
+	ktime_get_real_ts64(&ts);
+	time64_to_tm(ts.tv_sec, 0, &tm);
+	scnprintf(buf, len, "%04d%02d%02d-%02d%02d%02d-%06ld",
+		  (int)tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+		  tm.tm_hour, tm.tm_min, tm.tm_sec,
+		  (long)(ts.tv_nsec / 1000));
+}
+
 static void fdw_dentry_name(struct dentry *d, char *out, size_t outsz)
 {
 	const unsigned char *n;
@@ -451,7 +465,6 @@ static void fdw_work(struct work_struct *work)
 
 static int __init fdw_init(void)
 {
-	unsigned int i;
 	int ret;
 
 	if (slots < 1 || slots > FDW_MAX_SLOTS)
