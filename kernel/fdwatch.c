@@ -82,7 +82,7 @@
 #error "fdwatch targets Linux 5.15 (GKI android13-5.15 / android14-5.15) only"
 #endif
 
-#define FDW_VERSION "1.1.0"
+#define FDW_VERSION "1.3.0"
 
 /* ------------------------------------------------------------------ */
 /* tunables                                                            */
@@ -153,6 +153,15 @@ static unsigned int fdw_nslots;
 static DEFINE_SPINLOCK(fdw_lock);
 static struct workqueue_struct *fdw_wq;
 static bool fdw_stopping;
+
+/*
+ * Credentials of whoever loaded this module (normally root in the su/ksu
+ * domain).  Held for the module's lifetime and used as the fallback when the
+ * process that caused a drop is an ordinary app: an app cannot create files in
+ * /data/local/tmp, and neither can the kworker's own kernel domain, so the
+ * loader's credentials are the only ones that reliably can.
+ */
+static const struct cred *fdw_load_cred;
 
 static atomic64_t fdw_captured = ATOMIC64_INIT(0);
 static atomic64_t fdw_failed = ATOMIC64_INIT(0);
@@ -265,8 +274,25 @@ static void fdw_dentry_name(struct dentry *d, char *out, size_t outsz)
 		strscpy(out, (const char *)n, outsz);
 }
 
-/* The event layer. */
-static void fdw_log_new_fd(unsigned int fd, struct file *file)
+/*
+ * The event layer: "a file is being opened".
+ *
+ * Hooked on vfs_open, NOT on fd_install.  Why, measured on the target kernel:
+ *
+ *   fd_install         912 hits in a ten-second run, of which ZERO were
+ *                      regular files - every single one was an [eventfd],
+ *                      [eventpoll], pipe, socket or anon_inode.  Under
+ *                      CONFIG_LTO_CLANG_FULL, path_openat() got its fd_install
+ *                      inlined, so the out-of-line symbol survives only for the
+ *                      other callers (dup2, pipe, eventfd, epoll, ...).  The
+ *                      probe is "reachable" and the event log is still empty:
+ *                      a non-zero hit count is not evidence of coverage.
+ *
+ *   vfs_open            26460 hits, and it sits on the open(2) path after the
+ *                      file object exists and before O_TRUNC is applied, which
+ *                      is exactly the moment a new file can be recognised.
+ */
+static void fdw_log_new_open(const struct path *path, struct file *file)
 {
 	struct inode *inode;
 	char name[64];
@@ -274,43 +300,46 @@ static void fdw_log_new_fd(unsigned int fd, struct file *file)
 	loff_t size;
 
 	atomic64_inc(&fdw_fd_hits);
-	if (!file || !file->f_inode)
+	if (!path || !path->dentry)
 		return;
-	inode = file->f_inode;
+	inode = d_backing_inode(path->dentry);
+	if (!inode)
+		return;
 	mode = inode->i_mode;
 	size = i_size_read(inode);
 
 	if (debug_fds) {
-		fdw_dentry_name(file->f_path.dentry, name, sizeof(name));
-		pr_info("fd_install fd=%u pid=%d comm=%s mode=%o f_mode=0x%x size=%lld name='%s'\n",
-			fd, current->pid, current->comm, mode, file->f_mode,
-			(long long)size, name);
+		fdw_dentry_name(path->dentry, name, sizeof(name));
+		pr_info("vfs_open mode=%o f_mode=0x%x size=%lld pid=%d comm=%s name='%s'\n",
+			mode, file ? file->f_mode : 0, (long long)size,
+			current->pid, current->comm, name);
 	}
 
 	if (!S_ISREG(mode))
 		return;
 	atomic64_inc(&fdw_fd_reg);
-	if (!(file->f_mode & FMODE_WRITE))
+	if (!file || !(file->f_mode & FMODE_WRITE))
 		return;
 	if (size != 0)
 		return;
 
 	atomic64_inc(&fdw_fd_pass);
-	fdw_dentry_name(file->f_path.dentry, name, sizeof(name));
-	pr_info("new fd %u -> '%s' pid=%d comm=%s (size=0, writable)\n",
-		fd, name, current->pid, current->comm);
+	fdw_dentry_name(path->dentry, name, sizeof(name));
+	pr_info("new file '%s' pid=%d comm=%s (size=0, opened for write)\n",
+		name, current->pid, current->comm);
 }
 
-static int fdw_p_fd_install(struct kprobe *p, struct pt_regs *regs)
+/* int vfs_open(const struct path *path, struct file *file) */
+static int fdw_p_vfs_open(struct kprobe *p, struct pt_regs *regs)
 {
-	fdw_log_new_fd((unsigned int)regs->regs[0],
-		       (struct file *)regs->regs[1]);
+	fdw_log_new_open((const struct path *)regs->regs[0],
+			 (struct file *)regs->regs[1]);
 	return 0;
 }
 
-static struct kprobe fdw_kp_fd_install = {
-	.symbol_name = "fd_install",
-	.pre_handler = fdw_p_fd_install,
+static struct kprobe fdw_kp_vfs_open = {
+	.symbol_name = "vfs_open",
+	.pre_handler = fdw_p_vfs_open,
 };
 
 /*
@@ -495,7 +524,8 @@ static void fdw_do_dump(struct fdw_slot *slot)
 	char ts[40], path[PATH_MAX];
 	ssize_t got, n;
 	bool via_mapping = false;
-	bool reverted = false;
+	const struct cred *creds[3];
+	unsigned int nc, i;
 
 	size = i_size_read(inode);
 	cap = (unsigned long)max_dump_mb * 1024 * 1024;
@@ -554,36 +584,53 @@ static void fdw_do_dump(struct fdw_slot *slot)
 		 slot->comm[0] ? slot->comm : "?", slot->ino);
 
 	/*
-	 * Creating the dump is attempted with the caller's credentials first,
-	 * so that a root/su loader gets exactly the permissions it would have on
-	 * its own.  But the caller is often an ordinary app - and an app cannot
-	 * write into /data/local/tmp at all, which showed up as -EACCES on every
-	 * single capture.  In that case fall back to the kernel's own
-	 * credentials before giving up.
+	 * Which credentials to create the dump with.  Three candidates, tried in
+	 * order, because none of them is right for every case:
+	 *
+	 *   1. the caller's - a root/su loader gets exactly the permissions it
+	 *      would have on its own, which is the normal case;
+	 *   2. the loader's - captured at module_init.  An ordinary app that
+	 *      causes a drop cannot write /data/local/tmp at all (measured:
+	 *      -EACCES on every capture), and the kworker's own kernel domain is
+	 *      refused there by SELinux too, so the module remembers the
+	 *      privileged credentials it was loaded with;
+	 *   3. NULL, i.e. the kworker's own creds - last resort.
+	 *
+	 * open, write and close all happen under the same credentials: SELinux
+	 * checks the write against current(), not against the file's opener.
 	 */
+	nc = 0;
+	creds[nc++] = slot->cred;
+	if (fdw_load_cred && fdw_load_cred != slot->cred)
+		creds[nc++] = fdw_load_cred;
+	creds[nc++] = NULL;
+
 	out = ERR_PTR(-EACCES);
-	old = override_creds(slot->cred);
-	out = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, 0644);
-	if (IS_ERR(out)) {
-		revert_creds(old);
-		reverted = true;
+	n = -EACCES;
+	for (i = 0; i < nc; i++) {
+		old = creds[i] ? override_creds(creds[i]) : NULL;
 		out = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE,
 				0644);
-	}
-	if (IS_ERR(out)) {
-		if (!reverted)
+		if (IS_ERR(out)) {
+			if (creds[i])
+				revert_creds(old);
+			continue;
+		}
+		w = 0;
+		n = kernel_write(out, buf, (size_t)got, &w);
+		filp_close(out, NULL);
+		if (creds[i])
 			revert_creds(old);
+		break;
+	}
+	vfree(buf);
+
+	if (IS_ERR(out)) {
 		atomic64_inc(&fdw_failed);
-		pr_err("cannot create %s (%ld) - does %s exist, and is it writable?\n",
-		       path, (long)PTR_ERR(out), dump_dir);
-		vfree(buf);
+		pr_err("cannot create %s (%ld) with any of %u credential sets - does %s exist and allow writes?\n",
+		       path, (long)PTR_ERR(out), nc, dump_dir);
 		return;
 	}
-	n = kernel_write(out, buf, (size_t)got, &w);
-	filp_close(out, NULL);
-	if (!reverted)
-		revert_creds(old);
-	vfree(buf);
 
 	if (n == got) {
 		slot->best = (unsigned long)got;
@@ -650,6 +697,7 @@ static int __init fdw_init(void)
 	if (!fdw_slots)
 		return -ENOMEM;
 	fdw_nslots = slots;
+	fdw_load_cred = get_current_cred();
 	for (i = 0; i < fdw_nslots; i++)
 		INIT_DELAYED_WORK(&fdw_slots[i].work, fdw_work);
 
@@ -674,8 +722,8 @@ static int __init fdw_init(void)
 
 	if (scan_symbols) {
 		fdw_scan_register();
-	} else if (register_kprobe(&fdw_kp_fd_install)) {
-		pr_warn("cannot probe fd_install - the event log stays off\n");
+	} else if (register_kprobe(&fdw_kp_vfs_open)) {
+		pr_warn("cannot probe vfs_open - the event log stays off\n");
 	}
 
 	pr_info("v%s armed: ftruncate>=%uMiB, write>=%uKiB, dump_dir=%s, %u slots%s\n",
@@ -702,7 +750,7 @@ static void __exit fdw_exit(void)
 	if (scan_symbols)
 		fdw_scan_unregister();
 	else
-		unregister_kprobe(&fdw_kp_fd_install);
+		unregister_kprobe(&fdw_kp_vfs_open);
 
 	if (fdw_wq) {
 		for (i = 0; i < fdw_nslots; i++)
@@ -722,7 +770,12 @@ static void __exit fdw_exit(void)
 	fdw_slots = NULL;
 	fdw_nslots = 0;
 
-	pr_info("unloaded: captured=%lld partial=%lld failed=%lld dropped=%lld  fd_install hits=%lld regular=%lld passed-filter=%lld\n",
+	if (fdw_load_cred) {
+		put_cred(fdw_load_cred);
+		fdw_load_cred = NULL;
+	}
+
+	pr_info("unloaded: captured=%lld partial=%lld failed=%lld dropped=%lld  vfs_open hits=%lld regular=%lld passed-filter=%lld\n",
 		(long long)atomic64_read(&fdw_captured),
 		(long long)atomic64_read(&fdw_partial),
 		(long long)atomic64_read(&fdw_failed),
